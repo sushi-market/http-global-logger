@@ -48,7 +48,7 @@ class HttpLoggerTest extends TestCase
         return [$request, $response];
     }
 
-    public function test_logs_one_redacted_record_with_response_and_timing(): void
+    public function test_logs_linked_start_and_finish_with_redaction_and_timing(): void
     {
         $logger = $this->recorder();
         Route::post('/example', fn () => response()->json([
@@ -60,15 +60,21 @@ class HttpLoggerTest extends TestCase
         ]);
 
         self::assertSame(200, $response->getStatusCode());
-        self::assertCount(1, $logger->records);
-        $record = $logger->records[0];
+        self::assertCount(2, $logger->records);
+        [$record, $finished] = $logger->records;
+        self::assertSame('started', $record['event']);
+        self::assertSame('finished', $finished['event']);
+        self::assertSame($record['request_id'], $finished['request_id']);
+        self::assertSame($record['trace_id'], $finished['trace_id']);
+        self::assertArrayNotHasKey('response', $record);
+        self::assertArrayNotHasKey('request', $finished);
         self::assertSame('2', $record['request']['query']['page']);
         self::assertSame('[REDACTED]', $record['request']['query']['token']);
         self::assertSame('[REDACTED]', $record['request']['body']['nested']['PASSWORD']);
         self::assertSame('[REDACTED]', $record['request']['headers']['authorization']);
-        self::assertSame('[REDACTED]', $record['response']['headers']['set-cookie']);
-        self::assertSame('[REDACTED]', $record['response']['body']['nested']['token']);
-        self::assertGreaterThanOrEqual(0, $record['duration_ms']);
+        self::assertSame('[REDACTED]', $finished['response']['headers']['set-cookie']);
+        self::assertSame('[REDACTED]', $finished['response']['body']['nested']['token']);
+        self::assertGreaterThanOrEqual(0, $finished['duration_ms']);
         self::assertArrayHasKey('user_id', $record['initiator']);
     }
 
@@ -79,8 +85,8 @@ class HttpLoggerTest extends TestCase
         [, $response] = $this->exchange('/error');
 
         self::assertSame(403, $response->getStatusCode());
-        self::assertCount(1, $logger->records);
-        self::assertSame(403, $logger->records[0]['response']['status']);
+        self::assertCount(2, $logger->records);
+        self::assertSame(403, $logger->records[1]['response']['status']);
     }
 
     public function test_excluded_paths_are_not_logged(): void
@@ -101,8 +107,8 @@ class HttpLoggerTest extends TestCase
         [$request, $response] = $this->exchange('/stream');
         $this->app->make(LogHttpRequest::class)->terminate($request, $response);
 
-        self::assertCount(1, $logger->records);
-        self::assertSame(['omitted' => 'stream_or_file'], $logger->records[0]['response']['body']);
+        self::assertCount(2, $logger->records);
+        self::assertSame(['omitted' => 'stream_or_file'], $logger->records[1]['response']['body']);
     }
 
     public function test_large_payload_is_omitted(): void
@@ -112,6 +118,39 @@ class HttpLoggerTest extends TestCase
         Route::post('/large', fn () => response()->json(['data' => str_repeat('a', 100)]));
         $this->exchange('/large', ['data' => str_repeat('a', 100)]);
         self::assertSame(['omitted' => 'size_limit'], $logger->records[0]['request']['body']);
-        self::assertSame(['omitted' => 'size_limit'], $logger->records[0]['response']['body']);
+        self::assertSame(['omitted' => 'size_limit'], $logger->records[1]['response']['body']);
+    }
+    public function test_start_is_written_before_application_code_even_without_termination(): void
+    {
+        $logger = $this->recorder();
+        $request = Request::create('/api/failure', 'POST', ['name' => 'Alice']);
+        $exception = new \RuntimeException('Application failure');
+        try {
+            $this->app->make(LogHttpRequest::class)->handle($request, function () use ($logger, $exception) {
+                self::assertCount(1, $logger->records);
+                self::assertSame('started', $logger->records[0]['event']);
+                self::assertSame('Alice', $logger->records[0]['request']['body']['name']);
+                throw $exception;
+            });
+            self::fail('Expected original exception');
+        } catch (\RuntimeException $actual) {
+            self::assertSame($exception, $actual);
+        }
+        self::assertCount(1, $logger->records);
+    }
+
+    public function test_laravel_rendered_500_has_linked_completion(): void
+    {
+        $logger = $this->recorder();
+        Route::post('/crash', fn () => throw new \RuntimeException('Application failure'));
+        [, $response] = $this->exchange('/crash');
+        self::assertSame(500, $response->getStatusCode());
+        // Laravel also reports the application exception to its default logger.
+        $records = array_values(array_filter($logger->records, fn ($record) =>
+            ($record['direction'] ?? null) === 'incoming'
+        ));
+        self::assertCount(2, $records);
+        self::assertSame($records[0]['request_id'], $records[1]['request_id']);
+        self::assertSame(500, $records[1]['response']['status']);
     }
 }
